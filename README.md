@@ -1,6 +1,7 @@
 # Media-Slideshow-Python
 Media Slideshow application for Linux, writen in Python.
 
+```
 slideshow.py - image + video slideshow for Linux (Wayland and X11).
 
 USAGE
@@ -54,3 +55,4 @@ DEPENDENCIES
     HEIC / AVIF / JPEG XL when Qt has no plugin for them.
     Arch:   pacman -S pyside6 qt6-multimedia-ffmpeg qt6-wayland qt6-svg \
                        qt6-imageformats python-pillow
+```
