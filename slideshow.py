@@ -21,32 +21,38 @@ USAGE
                               are allowed; default: automatic, 1/5 of the icon size)
     --controls [visible|hidden] initial state of on-screen controls (default: visible)
     --controls-opacity OPACITY controls background opacity from 0.0 to 1.0 (default: 0.0)
+    --controls-dock DOCK      where the control panel sits: bottom, top, left or right
+                              (default: bottom; --dock is a short alias)
     -a1, --action-1 CMD       Command for key 1 (supports {path}, which is shell-quoted
                               automatically - do not add quotes around it)
     ...
     -a0, --action-10 CMD      Command for key 0 (supports {path}, as above)
 
 KEYS / MOUSE
-    Left / Right        previous / next
-    Up / Down / wheel   zoom in / out
-    Home / End          first / last
-    Space               next
-    P                   play / pause slideshow
-    V                   video play / pause
-    M                   mute / unmute
-    PgUp / PgDn         volume up / down
-    S                   toggle shuffle / sorted
-    A                   auto-rotate to fit on/off
-    1~0                 run custom shell commands (configured via CLI or COMMAND_MAPPINGS)
-    Delete              move current file to trash
-    O / Ctrl+O          open folder
-    F / F11             fullscreen
-    Esc / Q             quit
-    H                   toggle keep controls visible (pin)
-    I                   toggle file info overlay
-    Drag                cycles through items (drag left = next); when zoomed in,
-                        drag pans instead. Top bar: click = jump, drag = scrub.
-                        Video seek bar: bottom edge of the video (rotates with it).
+    Space           Next
+    Left / Right    Previous / next
+    Wheel           Previous / next (scroll up / down)
+    Up / Down       Zoom in / out
+    Ctrl + wheel    Zoom in / out
+    Home / End      First / last
+    P               Play / pause slideshow
+    V               Video play / pause
+    M               Mute / unmute
+    PgUp / PgDn     Volume up / down
+    S               Toggle shuffle / sorted
+    A               Auto-rotate to fit on/off
+    1~0             Run custom shell commands (configured via CLI or COMMAND_MAPPINGS)
+    Delete          Move current file to trash
+    O / Ctrl+O      Open folder
+    F / F11         Fullscreen
+    Esc / Q         Quit
+    H               Toggle keep controls visible (pin)
+    I               Toggle file info overlay
+    Drag            Cycles through items (drag left = next)
+    Top Seekbar     Jump/scrub though slideshow
+    Bottom Seekbar  Jump/scrib through current video
+    Control Panel   Long-press (~0.5 s) and drag to dock it bottom / top / left / right.
+                    Icons and info text wrap onto extra lines when the window is small.
 
 DEPENDENCIES
     PySide6 (Qt 6.5+, with the Qt Multimedia FFmpeg backend - the pip wheel has it)
@@ -68,8 +74,8 @@ import sys
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
-from PySide6.QtCore import (QEvent, QFile, QPointF, QProcess, QRectF, QSize, Qt,
-                            QTimer, QUrl, Signal)
+from PySide6.QtCore import (QEvent, QFile, QPoint, QPointF, QProcess, QRect, QRectF,
+                            QSize, Qt, QTimer, QUrl, Signal)
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage,
                            QImageReader, QMovie, QPainter, QPainterPath, QPen,
                            QPixmap, QPolygonF)
@@ -163,10 +169,31 @@ COMMAND_MAPPINGS = {
 # Names: prev next play shuffle rotate info pin trash folder quit; 'sep' = divider.
 # 'play' is defined but currently disabled (P still toggles the slideshow).
 CONTROL_ORDER = [
-    "prev", "next", "sep", #"play",
+    "prev", "next", #"play",
     "shuffle", "rotate", "info", "pin",
     "trash", "folder", "quit"
 ]
+
+# --------------------------------------------------------------------------- #
+# Control panel dock positions: bottom / top centre (horizontal bar) and centre left /
+# centre right (vertical bar). Set with --controls-dock or by long-press + drag.
+# --------------------------------------------------------------------------- #
+DOCKS = ("bottom", "top", "left", "right")
+_DOCK_ALIASES = {"bottom-center": "bottom", "bottom-centre": "bottom",
+                 "top-center": "top", "top-centre": "top",
+                 "center-left": "left", "centre-left": "left",
+                 "center-right": "right", "centre-right": "right"}
+
+
+# argparse `type`: accepts bottom / top / left / right (case-insensitive) and the long
+# forms such as 'center-left'.
+def _dock_arg(value: str) -> str:
+    key = value.strip().lower().replace("_", "-").replace(" ", "-")
+    key = _DOCK_ALIASES.get(key, key)
+    if key not in DOCKS:
+        raise argparse.ArgumentTypeError(
+            f"invalid dock '{value}' (choose bottom, top, left or right)")
+    return key
 
 
 # -> 'image' | 'video' | None, decided purely by file extension.
@@ -248,6 +275,43 @@ def folder_has_sub_media(root: str, include_hidden: bool = False) -> bool:
                for n in filenames):
             return True
     return False
+
+
+# --------------------------------------------------------------------------- #
+# text wrapping (control panel info line, file-info overlay, toasts)
+# --------------------------------------------------------------------------- #
+# Break opportunities: after whitespace and after / \\ _ - . , so paths and file names
+# wrap at natural places before a long word is broken in the middle.
+_WRAP_CHUNK = re.compile(r"[^\s/\\_\-.,]*[\s/\\_\-.,]+|[^\s/\\_\-.,]+")
+
+
+def wrap_text(text: str, fm: QFontMetrics, max_w: int, max_lines: int = 0):
+    """-> list of lines, each at most max_w pixels wide (explicit newlines are kept).
+    max_lines > 0 caps the result; the cut-off text is replaced by an ellipsis."""
+    max_w = max(20, int(max_w))
+    out = []
+    for para in text.split("\n"):
+        line, line_w = "", 0
+        for chunk in _WRAP_CHUNK.findall(para):
+            cw = fm.horizontalAdvance(chunk)
+            sw = fm.horizontalAdvance(chunk.rstrip())   # trailing blanks may overhang
+            if line and line_w + sw > max_w:
+                out.append(line.rstrip())
+                line, line_w = "", 0
+            if sw > max_w:                              # one word too long: hard-break it
+                for ch in chunk:
+                    chw = fm.horizontalAdvance(ch)
+                    if line and line_w + chw > max_w:
+                        out.append(line.rstrip())
+                        line, line_w = "", 0
+                    line, line_w = line + ch, line_w + chw
+            else:
+                line, line_w = line + chunk, line_w + cw
+        out.append(line.rstrip())
+    if max_lines > 0 and len(out) > max_lines:
+        out = out[:max_lines]
+        out[-1] = fm.elidedText(out[-1] + "\u2026", Qt.TextElideMode.ElideRight, max_w)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -510,8 +574,8 @@ class IconButton(QAbstractButton):
 
 
 # Thin vertical divider between button groups.
-def _sep(height: int = 26):
-    f = QFrame()
+def _sep(height: int = 26, parent=None):
+    f = QFrame(parent)
     f.setFixedSize(1, height)
     f.setStyleSheet("background: rgba(255,255,255,60);")
     return f
@@ -527,8 +591,32 @@ def _apply_drop_shadow(widget: QWidget, radius: float = 6.0, offset_y: float = 1
     widget.setGraphicsEffect(effect)
 
 
+class _PanelPlan:
+    """Result of laying the control panel out: its size, the info text lines and the
+    rectangle of every visible item. Pure data - building one touches no widget."""
+    __slots__ = ("size", "info_lines", "info_rect", "placements")
+
+    def __init__(self, size, info_lines, info_rect, placements):
+        self.size, self.info_lines = size, info_lines
+        self.info_rect, self.placements = info_rect, placements
+
+
 class Panel(QWidget):
-    """Bottom control panel. The video group only shows while a video is current."""
+    """Control panel, docked bottom / top (horizontal) or left / right (vertical).
+
+    The widgets are flowed by hand instead of with a QLayout: when the window is too small
+    for a single row (or column when docked left / right) they wrap onto extra lines,
+    balanced so no line is left with a lone icon, and the info text wraps over several
+    lines instead of being cut off. Long-press anywhere on the panel and drag to move it
+    to another dock (the Viewer decides where it lands)."""
+    dragStarted = Signal(QPointF)    # global cursor position
+    dragMoved = Signal(QPointF)
+    dragFinished = Signal(QPointF)
+
+    PAD_X, PAD_TOP, PAD_BOTTOM, GAP = 12, 6, 8, 4
+    LONG_PRESS_MS = 450              # hold this long without moving to start a drag
+    LONG_PRESS_SLOP = 10             # px of movement that turns the press into a normal click
+    MAX_INFO_LINES = 4
 
     def __init__(self, parent, icon_size: int = 40, icon_padding: int | None = None, opacity: float = 0.8):
         super().__init__(parent)
@@ -546,40 +634,44 @@ class Panel(QWidget):
             QSlider::sub-page:horizontal {{ background: #6cb8ff; border-radius: 2px; }}
             QSlider::handle:horizontal {{ background: white; width: 12px; margin: -5px 0; border-radius: 6px; }}
         """)
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(12, 6, 12, 8)
-        outer.setSpacing(2)
-        self.info = QLabel("")
+        self.icon_size = icon_size
+        self.sep_h = max(16, int(icon_size * 0.65))
+        self._vertical = False
+        self._video = self._audio = False          # which optional groups are shown
+        self._info_counter = self._info_detail = ""
+        self._pos_ms = self._dur_ms = 0
+
+        # Press / long-press / drag tracking (see _press_*).
+        self._pressing = self._dragging = False
+        self._press_obj = None
+        self._press_gpos = self._cur_gpos = QPointF()
+        self._lp_timer = QTimer(self, singleShot=True)
+        self._lp_timer.timeout.connect(self._long_press)
+
+        # Info line: "12 / 345   sub/folder/file.jpg", wrapped by relayout().
+        self.info = QLabel("", self)
         self.info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        # Ignored: a long file path must not stretch the panel; the text is elided
-        # instead (_elide).
-        self.info.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         f = QFont(self.info.font())
         f.setPointSizeF(max(8.0, f.pointSizeF() * 0.9))
         self.info.setFont(f)
         _apply_drop_shadow(self.info)
-        outer.addWidget(self.info)
-        self._info_text = ""
 
-        row = QHBoxLayout()
-        row.setSpacing(4)
-        outer.addLayout(row)
+        def btn(icon, tip, checkable=False):
+            return IconButton(icon, tip, icon_size, icon_padding, self, checkable=checkable)
 
-        self.b_prev = IconButton("prev", "Previous  (Left)", icon_size, icon_padding)
-        self.b_play = IconButton("play", "Play / pause slideshow  (Space)", icon_size, icon_padding)
-        self.b_next = IconButton("next", "Next  (Right)", icon_size, icon_padding)
-        self.b_shuffle = IconButton("shuffle", "Toggle shuffle / sorted mode  (S)", icon_size, icon_padding, checkable=True)
-        self.b_rot = IconButton("rotate", "Rotate to best fit  (A)", icon_size, icon_padding, checkable=True)
-        self.b_info = IconButton("info", "Toggle file info  (I)", icon_size, icon_padding, checkable=True)
-        self.b_pin = IconButton("pin", "Keep controls visible / pin  (H)", icon_size, icon_padding, checkable=True)
-        self.b_del = IconButton("trash", "Delete current file  (Delete)", icon_size, icon_padding)
-        self.b_folder = IconButton("folder", "Open folder in a new slideshow  (O)", icon_size, icon_padding)
-        self.b_quit = IconButton("quit", "Quit slideshow  (Q)", icon_size, icon_padding)
-
-        sep_h = max(16, int(icon_size * 0.65))
+        self.b_prev = btn("prev", "Previous  (Left)")
+        self.b_play = btn("play", "Play / pause slideshow  (Space)")
+        self.b_next = btn("next", "Next  (Right)")
+        self.b_shuffle = btn("shuffle", "Toggle shuffle / sorted mode  (S)", True)
+        self.b_rot = btn("rotate", "Rotate to best fit  (A)", True)
+        self.b_info = btn("info", "Toggle file info  (I)", True)
+        self.b_pin = btn("pin", "Keep controls visible / pin  (H)", True)
+        self.b_del = btn("trash", "Delete current file  (Delete)")
+        self.b_folder = btn("folder", "Open folder in a new slideshow  (O)")
+        self.b_quit = btn("quit", "Quit slideshow  (Q)")
 
         # name -> widget lookup for CONTROL_ORDER. Widgets not listed there are created
-        # but never added to the layout, so they never appear.
+        # but never shown.
         widgets_map = {
             "prev": self.b_prev,
             "play": self.b_play,
@@ -593,64 +685,282 @@ class Panel(QWidget):
             "quit": self.b_quit,
         }
 
-        # Build the toolbar in the configured order.
+        # Every flowed widget in display order: (widget, kind, group). kind picks its size
+        # (btn / sep / time / volume); group says when it is shown: main = always,
+        # video = while a video is current, audio = video and a sound device exists.
+        self._items = []
         for item in CONTROL_ORDER:
             if item == "sep":
-                row.addWidget(_sep(sep_h))
+                self._items.append((_sep(self.sep_h, self), "sep", "main"))
             elif item in widgets_map:
-                row.addWidget(widgets_map[item])
+                self._items.append((widgets_map[item], "btn", "main"))
+        used = {id(w) for w, _k, _g in self._items}
+        for w in widgets_map.values():
+            if id(w) not in used:
+                w.hide()
 
-        # Video-only controls (play/pause, time, mute, volume), revealed by set_mode().
-        self.vgroup = QWidget()
-        vl = QHBoxLayout(self.vgroup)
-        vl.setContentsMargins(0, 0, 0, 0)
-        vl.setSpacing(4)
-        self.b_vplay = IconButton("pause", "Play / pause video  (V)", icon_size, icon_padding)
-        self.time = QLabel("0:00 / 0:00")
-        self.time.setMinimumWidth(92)
+        # Video-only controls (play/pause, time, mute, volume).
+        self._vsep = _sep(self.sep_h, self)
+        self.b_vplay = btn("pause", "Play / pause video  (V)")
+        self.time = QLabel(self._time_text(False), self)
         self.time.setAlignment(Qt.AlignmentFlag.AlignCenter)
         _apply_drop_shadow(self.time)
-        self.b_mute = IconButton("speaker_muted", "Mute / unmute  (M)", icon_size, icon_padding)
-        self.volume = QSlider(Qt.Orientation.Horizontal)
+        self.b_mute = btn("speaker_muted", "Mute / unmute  (M)")
+        self.volume = QSlider(Qt.Orientation.Horizontal, self)
         self.volume.setRange(0, 100)
         self.volume.setValue(80)
-        self.volume.setFixedWidth(90)
         self.volume.setToolTip("Volume  (PgUp / PgDn)")
         self.volume.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         _apply_drop_shadow(self.volume)
-        self._vsep = _sep(sep_h)
-        for w in (self._vsep, self.b_vplay, self.time, self.b_mute, self.volume):
-            vl.addWidget(w)
-        row.addWidget(self.vgroup)
-        self.vgroup.hide()
+        self._items += [(self._vsep, "sep", "video"), (self.b_vplay, "btn", "video"),
+                        (self.time, "time", "video"), (self.b_mute, "btn", "audio"),
+                        (self.volume, "volume", "audio")]
+        for w, _kind, grp in self._items:
+            w.installEventFilter(self)            # long-press works over every child
+            if grp != "main":
+                w.hide()
 
-    def set_info(self, text: str):
-        self._info_text = text
-        self._elide()
+    # ------------------------------------------------------------- content --
+    # counter ("12 / 345") is always shown; detail (the relative path) only in a horizontal
+    # dock, where there is room for it. The new text is laid out by the next relayout().
+    def set_info(self, counter: str, detail: str = ""):
+        self._info_counter, self._info_detail = counter, detail
 
-    def _elide(self):
-        fm = QFontMetrics(self.info.font())
-        self.info.setText(fm.elidedText(self._info_text, Qt.TextElideMode.ElideMiddle,
-                                        max(80, self.width() - 28)))
-
-    def resizeEvent(self, ev):
-        super().resizeEvent(ev)
-        self._elide()
-
-    def set_time(self, pos_ms: int, dur_ms: int):
+    # Horizontal dock: "0:12 / 3:45". Vertical dock: two short lines. widest=True measures
+    # with the duration on both sides (the widest the text can get) so the label keeps
+    # one width while the position ticks.
+    def _time_text(self, vertical=None, widest=False):
         def f(ms):
             s = max(0, int(ms // 1000))
             return f"{s // 60}:{s % 60:02d}"
-        self.time.setText(f"{f(pos_ms)} / {f(dur_ms)}")
+        vertical = self._vertical if vertical is None else vertical
+        pos = self._dur_ms if widest else self._pos_ms
+        return f"{f(pos)}{chr(10) if vertical else ' / '}{f(self._dur_ms)}"
+
+    def set_time(self, pos_ms: int, dur_ms: int):
+        self._pos_ms, self._dur_ms = pos_ms, dur_ms
+        self.time.setText(self._time_text())
 
     # video: show the video controls. audio: also show mute + volume (hidden when there
-    # is no sound device).
+    # is no sound device). Takes effect at the next relayout().
     def set_mode(self, video: bool, audio: bool):
-        self.vgroup.setVisible(video)
-        self.b_mute.setVisible(audio)
-        self.volume.setVisible(audio)
-        self.layout().activate()
-        self.adjustSize()
+        self._video, self._audio = video, audio
+
+    @property
+    def dragging(self) -> bool:
+        return self._dragging
+
+    # ------------------------------------------------------------- layout ---
+    def _group_on(self, group: str) -> bool:
+        return group == "main" or (self._video and (group == "video" or self._audio))
+
+    def _item_size(self, kind: str, vertical: bool) -> QSize:
+        s = self.icon_size
+        if kind == "btn":
+            return QSize(s, s)
+        if kind == "sep":                       # divider across the flow direction
+            return QSize(self.sep_h, 1) if vertical else QSize(1, self.sep_h)
+        if kind == "time":
+            fm = QFontMetrics(self.time.font())
+            lines = re.sub(r"\d", "0", self._time_text(vertical, True)).split("\n")
+            w = max(fm.horizontalAdvance(ln) for ln in lines) + 8
+            return QSize(w if vertical else max(92, w), fm.height() * len(lines) + 4)
+        return QSize(max(48, s) if vertical else 90, 22)       # volume slider
+
+    # Greedy line breaking. sizes = [(main, cross, is_sep)]; -> list of index lists. A
+    # divider never starts or ends a line (it would dangle after a wrap).
+    @staticmethod
+    def _break_lines(sizes, max_len, gap):
+        lines, cur = [[]], 0
+        for i, (main, _cross, _sep_flag) in enumerate(sizes):
+            add = main + (gap if lines[-1] else 0)
+            if lines[-1] and cur + add > max_len:
+                lines.append([])
+                cur, add = 0, main
+            lines[-1].append(i)
+            cur += add
+        out = []
+        for ln in lines:
+            while ln and sizes[ln[0]][2]:
+                ln.pop(0)
+            while ln and sizes[ln[-1]][2]:
+                ln.pop()
+            if ln:
+                out.append(ln)
+        return out
+
+    # Break at max_len, then find the narrowest length that still gives the same number of
+    # lines, so 10 icons over two lines become 5 + 5 instead of 9 + 1.
+    @classmethod
+    def _balanced_lines(cls, sizes, max_len, gap):
+        lines = cls._break_lines(sizes, max_len, gap)
+        if len(lines) > 1:
+            lo = max((m for m, _c, sp in sizes if not sp), default=1)
+            hi = max_len
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if len(cls._break_lines(sizes, mid, gap)) <= len(lines):
+                    hi = mid
+                else:
+                    lo = mid + 1
+            lines = cls._break_lines(sizes, lo, gap)
+        return lines
+
+    # Lay everything out for a horizontal (bottom / top) or vertical (left / right) bar
+    # that has at most avail_w x avail_h pixels. Touches no widget, so it can also
+    # measure a dock the panel is not in yet.
+    def _plan(self, vertical: bool, avail_w: int, avail_h: int) -> _PanelPlan:
+        gap = self.GAP
+        items = [(w, kind, self._item_size(kind, vertical))
+                 for w, kind, grp in self._items if self._group_on(grp)]
+        sizes = [((s.height(), s.width()) if vertical else (s.width(), s.height()))
+                 + (kind == "sep",) for _w, kind, s in items]
+        fm = QFontMetrics(self.info.font())
+        line_h = fm.lineSpacing()
+        counter, detail = self._info_counter, ("" if vertical else self._info_detail)
+        text = f"{counter}   {detail}" if detail else counter
+
+        if vertical:
+            # Only the counter fits next to a narrow column; the full path is in the
+            # file-info overlay (I).
+            head = self.PAD_TOP + (line_h + 2 if text else 0)
+            lines = self._balanced_lines(sizes, max(40, avail_h - head - self.PAD_BOTTOM), gap)
+        else:
+            inner_max = max(60, avail_w - 2 * self.PAD_X)
+            lines = self._balanced_lines(sizes, inner_max, gap)
+        line_main = [sum(sizes[i][0] for i in ln) + gap * (len(ln) - 1) for ln in lines]
+        line_cross = [max(sizes[i][1] for i in ln) for ln in lines]
+        tot_main = max(line_main, default=0)
+        tot_cross = sum(line_cross) + gap * max(0, len(lines) - 1)
+
+        if vertical:
+            inner_w = max(tot_cross, fm.horizontalAdvance(text) if text else 0)
+        else:
+            inner_w = max(tot_main, min(inner_max, 320))
+        info_lines = wrap_text(text, fm, inner_w, self.MAX_INFO_LINES) if text else []
+        info_h = line_h * len(info_lines)
+        if not vertical:
+            head = self.PAD_TOP + (info_h + 2 if info_lines else 0)
+        width = inner_w + 2 * self.PAD_X
+        height = head + (tot_main if vertical else tot_cross) + self.PAD_BOTTOM
+
+        placements = []
+        cross_pos = self.PAD_X + (inner_w - tot_cross) // 2 if vertical else head
+        for ln, lm, lc in zip(lines, line_main, line_cross):
+            main_pos = head + (tot_main - lm) // 2 if vertical else self.PAD_X + (inner_w - lm) // 2
+            for i in ln:
+                w, kind, sz = items[i]
+                m, c = sizes[i][0], sizes[i][1]
+                cp = cross_pos + (lc - c) // 2
+                x, y = (cp, main_pos) if vertical else (main_pos, cp)
+                placements.append((w, kind, QRect(x, y, sz.width(), sz.height())))
+                main_pos += m + gap
+            cross_pos += lc + gap
+        return _PanelPlan(QSize(width, height), info_lines,
+                          QRect(self.PAD_X, self.PAD_TOP, inner_w, info_h), placements)
+
+    # Size the panel would have in `dock` within avail_w x avail_h (used for the drop
+    # preview while dragging).
+    def measure(self, dock: str, avail_w: int, avail_h: int) -> QSize:
+        return self._plan(dock in ("left", "right"), avail_w, avail_h).size
+
+    # Apply the layout: shows the items that fit the current mode, hides the rest, wraps
+    # the info text and resizes the panel. The Viewer positions it afterwards.
+    def relayout(self, dock: str, avail_w: int, avail_h: int):
+        self._vertical = dock in ("left", "right")
+        plan = self._plan(self._vertical, avail_w, avail_h)
+        placed = set()
+        for w, kind, rect in plan.placements:
+            if kind != "btn":
+                w.setFixedSize(rect.size())
+            if kind == "time":
+                w.setText(self._time_text())
+            w.setGeometry(rect)
+            w.setVisible(True)
+            placed.add(id(w))
+        for w, _kind, _grp in self._items:
+            if id(w) not in placed:
+                w.setVisible(False)
+        self.info.setText("\n".join(plan.info_lines))
+        self.info.setGeometry(plan.info_rect)
+        self.info.setVisible(bool(plan.info_lines))
+        if self.size() != plan.size:
+            self.resize(plan.size)
+
+    # ---------------------------------------------- long-press + drag to dock --
+    # Presses reach us two ways: the event filter (the press landed on a child such as a
+    # button) or the panel's own mouse events (it landed on bare panel / the info label).
+    # Both feed the same state machine, which tolerates being called twice per event.
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t == QEvent.Type.MouseButtonPress:
+            if ev.button() == Qt.MouseButton.LeftButton:
+                self._press_begin(ev.globalPosition(), obj)
+        elif t == QEvent.Type.MouseMove:
+            if self._pressing:
+                self._press_move(ev.globalPosition())
+                if self._dragging:
+                    return True                  # the child must not react to the drag
+        elif t == QEvent.Type.MouseButtonRelease:
+            if ev.button() == Qt.MouseButton.LeftButton and self._pressing:
+                was_dragging = self._dragging
+                self._press_end(ev.globalPosition())
+                # Swallow the release so a button does not "click" when the drag ends.
+                # (A slider needs its release to leave the pressed state.)
+                if was_dragging and not isinstance(obj, QSlider):
+                    return True
+        return False
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._press_begin(e.globalPosition(), self)
+        e.accept()
+
+    def mouseMoveEvent(self, e):
+        if self._pressing:
+            self._press_move(e.globalPosition())
+        e.accept()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self._pressing:
+            self._press_end(e.globalPosition())
+        e.accept()
+
+    def _press_begin(self, gpos, obj):
+        if self._pressing:
+            return
+        self._pressing, self._dragging = True, False
+        self._press_obj, self._press_gpos, self._cur_gpos = obj, gpos, gpos
+        self._lp_timer.start(self.LONG_PRESS_MS)
+
+    def _press_move(self, gpos):
+        self._cur_gpos = gpos
+        if self._dragging:
+            self.dragMoved.emit(gpos)
+        elif (gpos - self._press_gpos).manhattanLength() > self.LONG_PRESS_SLOP:
+            self._lp_timer.stop()                # moved too soon: an ordinary click / drag
+
+    # The hold timer fired with the cursor still: the press becomes a panel drag.
+    def _long_press(self):
+        if not self._pressing or self._dragging:
+            return
+        self._dragging = True
+        obj = self._press_obj
+        if isinstance(obj, QAbstractButton):
+            obj.setDown(False)                   # cancel the button's own press
+        elif isinstance(obj, QSlider):
+            obj.setSliderDown(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.ClosedHandCursor)
+        self.dragStarted.emit(self._cur_gpos)
+
+    def _press_end(self, gpos):
+        self._lp_timer.stop()
+        was_dragging = self._dragging
+        self._pressing = self._dragging = False
+        self._press_obj = None
+        if was_dragging:
+            QApplication.restoreOverrideCursor()
+            self.dragFinished.emit(gpos)
 
 
 class TopBar(QWidget):
@@ -777,6 +1087,7 @@ class Viewer(QWidget):
         # _drag: None | 'cycle' | 'pan' | 'seek'. _acc: horizontal px accumulated
         # towards the next cycle step.
         self._drag, self._last, self._acc = None, QPointF(), 0.0
+        self._wheel_acc = 0.0                   # accumulated wheel delta (see wheelEvent)
 
         # '--controls hidden' starts hidden but pinned: once mouse movement reveals them
         # they stay until unpinned (H / pin button).
@@ -786,6 +1097,16 @@ class Viewer(QWidget):
 
         self._last_gpos = None
         self._toast = ""
+
+        # Control panel dock (bottom / top / left / right) and the state around moving it.
+        # _panel_rect is where the panel sits even while it is auto-hidden, so overlays
+        # can keep clear of it; _dock_preview is the drop target shown during a drag.
+        self._dock = getattr(args, "controls_dock", "bottom")
+        self._panel_rect = QRect()
+        self._dock_preview = None
+        self._drag_target = self._dock
+        self._drag_grab = QPoint()
+        self._drag_start = QPointF()
 
         self.setWindowTitle("Slideshow")
         self.setMouseTracking(True)
@@ -798,6 +1119,9 @@ class Viewer(QWidget):
         self.panel.b_rot.setChecked(self.auto_rotate)
         self.panel.b_info.setChecked(self.show_file_info)
         self.panel.b_pin.setChecked(self._pinned)
+        self.panel.dragStarted.connect(self._on_panel_drag_start)
+        self.panel.dragMoved.connect(self._on_panel_drag_move)
+        self.panel.dragFinished.connect(self._on_panel_drag_end)
 
         # Timers: slideshow advance | debounced navigation | auto-hide controls | end
         # fast-paint mode | clear toast.
@@ -1236,6 +1560,7 @@ class Viewer(QWidget):
     def _on_vdur(self, dur):
         self.v_dur = dur
         self.panel.set_time(self.v_pos, dur)
+        self._place_overlays()                  # the time label may need a new width
 
     # Playing slideshow: advance when the video ends (it plays once). Paused: the clip
     # loops instead.
@@ -1390,6 +1715,7 @@ class Viewer(QWidget):
         if a.icon_padding is not None:
             argv.append(f"--icon-padding={a.icon_padding}")
         argv.append(f"--controls={a.controls}")
+        argv.append(f"--controls-dock={self._dock}")
         argv.append(f"--controls-opacity={a.controls_opacity}")
         for n in range(1, 11):                  # -a1 .. -a0 command-line actions
             cmd = getattr(a, f"action_{n}", "")
@@ -1459,15 +1785,101 @@ class Viewer(QWidget):
         self._place_overlays()
         self._relayout()
 
+    EDGE_GAP = 14                      # panel <-> window edge
+    TOP_CLEAR = 24                     # first free row below the slideshow progress bar
+
+    # Pixels the panel may use in `dock`: the whole width for a bottom / top bar, the whole
+    # height (symmetric, so it stays centred) for a left / right bar.
+    def _dock_avail(self, dock):
+        W, H = self.width(), self.height()
+        if dock in ("left", "right"):
+            return W - 2 * self.EDGE_GAP, H - 2 * self.TOP_CLEAR
+        return W - 2 * self.EDGE_GAP, H - self.TOP_CLEAR - self.EDGE_GAP
+
+    # Where a panel of `size` sits in `dock`: centred on the bottom / top edge (the top
+    # one below the progress bar) or on the left / right edge.
+    def _dock_rect(self, dock, size):
+        W, H = self.width(), self.height()
+        pw, ph = size.width(), size.height()
+        if dock == "top":
+            x, y = (W - pw) // 2, self.TOP_CLEAR
+        elif dock == "left":
+            x, y = self.EDGE_GAP, (H - ph) // 2
+        elif dock == "right":
+            x, y = W - pw - self.EDGE_GAP, (H - ph) // 2
+        else:
+            x, y = (W - pw) // 2, H - ph - self.EDGE_GAP
+        return QRect(x, y, pw, ph)
+
+    # Nearest window edge to p, by fraction of the window (the four triangles cut by the
+    # diagonals), so it behaves the same on wide and tall windows.
+    def _dock_for_point(self, p):
+        W, H = max(1, self.width()), max(1, self.height())
+        d = {"left": p.x() / W, "right": 1 - p.x() / W,
+             "top": p.y() / H, "bottom": 1 - p.y() / H}
+        return min(d, key=d.get)
+
     def _place_overlays(self):
         W, H = self.width(), self.height()
         self.topbar.setGeometry(0, 0, W, 16)
-        self.panel.adjustSize()
-        # Always center the control panel accurately using exact window width
-        self.panel.move((W - self.panel.width()) // 2,
-                        H - self.panel.height() - 14)
+        if not self.panel.dragging:             # while dragged it follows the cursor
+            aw, ah = self._dock_avail(self._dock)
+            self.panel.relayout(self._dock, aw, ah)
+            self._panel_rect = self._dock_rect(self._dock, self.panel.size())
+            self.panel.move(self._panel_rect.topLeft())
         self.topbar.raise_()
         self.panel.raise_()
+
+    # --- moving the panel: long-press + drag ---------------------------------------
+    # The panel follows the cursor while a translucent outline marks the dock it would
+    # snap to; releasing drops it there. A hold with (almost) no movement changes nothing.
+    def _update_dock_preview(self, local):
+        self._drag_target = self._dock_for_point(local)
+        aw, ah = self._dock_avail(self._drag_target)
+        size = self.panel.measure(self._drag_target, aw, ah)
+        self._dock_preview = self._dock_rect(self._drag_target, size)
+        self.update()
+
+    def _on_panel_drag_start(self, gpos):
+        self._drag_start = gpos
+        self._drag_grab = self.panel.mapFromGlobal(gpos.toPoint())
+        self._hide_timer.stop()
+        self.panel.raise_()
+        self._update_dock_preview(self.mapFromGlobal(gpos.toPoint()))
+
+    def _on_panel_drag_move(self, gpos):
+        local = self.mapFromGlobal(gpos.toPoint())
+        pos = local - self._drag_grab
+        pw, ph = self.panel.width(), self.panel.height()
+        self.panel.move(min(max(0, pos.x()), max(0, self.width() - pw)),
+                        min(max(0, pos.y()), max(0, self.height() - ph)))
+        self._update_dock_preview(local)
+
+    def _on_panel_drag_end(self, gpos):
+        moved = (gpos - self._drag_start).manhattanLength() >= 24
+        if moved and self._drag_target != self._dock:
+            self._dock = self._drag_target
+            self.toast(f"Controls: {self._dock}")
+        self._dock_preview = None
+        self._place_overlays()                  # the panel snaps to its dock
+        self._show_controls()
+        self.update()
+
+    # Top-left corner and maximum width for the file-info overlay: kept clear of the
+    # control panel wherever it is docked.
+    def _overlay_anchor(self):
+        W = self.width()
+        R = self._panel_rect
+        ox, oy, mw = 20, 24, W - 40
+        if not R.isNull():
+            if self._dock == "top":
+                oy = R.bottom() + 10
+            elif self._dock == "left":
+                ox = R.right() + 10
+                mw = W - ox - 20
+            elif self._dock == "right":
+                mw = R.left() - 10 - 20
+        return ox, oy, max(120, mw)
 
     # Paint order: black -> media (+ video seek bar) -> error message -> file info ->
     # toast.
@@ -1488,6 +1900,14 @@ class Viewer(QWidget):
             p.drawText(self.rect().adjusted(40, 40, -40, -40),
                        Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self._message)
 
+        if self._dock_preview is not None:      # where a dragged control panel would land
+            p.save()
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setPen(QPen(QColor(108, 184, 255, 190), 2))
+            p.setBrush(QColor(108, 184, 255, 45))
+            p.drawRoundedRect(QRectF(self._dock_preview), 14, 14)
+            p.restore()
+
         if self.show_file_info and self.items:
             self._paint_file_info(p)
 
@@ -1496,19 +1916,28 @@ class Viewer(QWidget):
             f.setPointSize(14)
             p.setFont(f)
             fm = QFontMetrics(f)
-            tw, th = fm.horizontalAdvance(self._toast) + 36, fm.height() + 14
-            r = QRectF((self.width() - tw) / 2, 30, tw, th)
+            lines = wrap_text(self._toast, fm, self.width() - 80)
+            line_h = fm.lineSpacing()
+            tw = max(fm.horizontalAdvance(ln) for ln in lines) + 36
+            th = line_h * len(lines) + 14
+            ty = 30
+            if self._dock == "top":                     # the top is taken by the panel
+                ty = self.height() - th - 60            # and the file info below it
+            r = QRectF((self.width() - tw) / 2, ty, tw, th)
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(0, 0, 0, 175))
             p.drawRoundedRect(r, 10, 10)
             p.setPen(WHITE)
-            p.drawText(r, Qt.AlignmentFlag.AlignCenter, self._toast)
+            for k, ln in enumerate(lines):
+                p.drawText(QRectF(r.left(), r.top() + 7 + k * line_h, tw, line_h),
+                           Qt.AlignmentFlag.AlignCenter, ln)
 
+    # File info box, wrapped to the space the control panel leaves free (see
+    # _overlay_anchor) and capped so it never runs off the bottom of the window.
     def _paint_file_info(self, p: QPainter):
         path = self.items[self.index]
-        res_str = f"{self._msize.width()} × {self._msize.height()}" if self._msize else "Unknown"
-        info_str = f"Path: {path}\nResolution: {res_str}"
+        res_str = f"{self._msize.width()} \u00d7 {self._msize.height()}" if self._msize else "Unknown"
 
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1517,19 +1946,22 @@ class Viewer(QWidget):
         p.setFont(f)
         fm = QFontMetrics(f)
 
-        lines = info_str.split('\n')
-        max_w = max(fm.horizontalAdvance(l) for l in lines)
-        tw = max_w + 36
-        th = (fm.height() * len(lines)) + 20
+        ox, oy, mw = self._overlay_anchor()
+        line_h = fm.lineSpacing()
+        max_lines = max(2, (self.height() - oy - 40) // line_h)
+        lines = wrap_text(f"Path: {path}\nResolution: {res_str}", fm, mw - 36, max_lines)
+        tw = max(fm.horizontalAdvance(ln) for ln in lines) + 36
+        th = line_h * len(lines) + 20
 
-        r = QRectF(20, 24, tw, th)
+        r = QRectF(ox, oy, tw, th)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(0, 0, 0, 190))
         p.drawRoundedRect(r, 8, 8)
 
         p.setPen(WHITE)
-        text_rect = r.adjusted(18, 10, -18, -10)
-        p.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, info_str)
+        for k, ln in enumerate(lines):
+            p.drawText(QRectF(ox + 18, oy + 10 + k * line_h, tw - 36, line_h),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, ln)
         p.restore()
 
     # Draw in image coordinates: move to window centre + pan, rotate, scale by fit*zoom.
@@ -1587,13 +2019,40 @@ class Viewer(QWidget):
         vis = vr.intersected(QRectF(-hx, -hy, 2 * hx, 2 * hy))
         if vis.width() < 80 or vis.height() < self.BAR_H + 8:
             return None
-        bottom = vis.bottom()
-        if self.rot == 0 and self._controls_visible and self.panel.isVisible():
-            pr = QRectF(self.panel.geometry()).translated(-W / 2, -H / 2)
-            if vis.intersects(pr):
-                bottom = min(bottom, pr.top() - 6)
-        rect = QRectF(vis.left() + 10, bottom - self.BAR_H - 6, vis.width() - 20, self.BAR_H)
+        rect = QRectF(vis.left() + 10, vis.bottom() - self.BAR_H - 6, vis.width() - 20, self.BAR_H)
+        if self._controls_visible and self.panel.isVisible() and not self.panel.dragging:
+            rect = self._seekbar_avoid(rect, self._to_local_rect(QRectF(self.panel.geometry())), vis)
         return rect, vis
+
+    # Window-coordinate rectangle -> bounding box in the video's own (rotated) frame.
+    def _to_local_rect(self, r: QRectF) -> QRectF:
+        pts = [self._to_local(q) for q in (r.topLeft(), r.topRight(),
+                                           r.bottomLeft(), r.bottomRight())]
+        xs, ys = [q.x() for q in pts], [q.y() for q in pts]
+        return QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+
+    # Keep the seek bar off the control panel (pr, in video coordinates). A wide panel
+    # (docked top / bottom) pushes the bar up above it; a tall one (docked left / right)
+    # clips the bar to the wider free side; the other way is the fallback.
+    def _seekbar_avoid(self, rect: QRectF, pr: QRectF, vis: QRectF) -> QRectF:
+        if not rect.adjusted(0, -6, 0, 6).intersects(pr):
+            return rect
+
+        def above():
+            r = QRectF(rect.left(), pr.top() - 12 - self.BAR_H, rect.width(), self.BAR_H)
+            return r if r.top() >= vis.top() else None
+
+        def beside():
+            left = QRectF(rect.left(), rect.top(), pr.left() - 8 - rect.left(), rect.height())
+            right = QRectF(pr.right() + 8, rect.top(), rect.right() - pr.right() - 8, rect.height())
+            best = max((left, right), key=lambda r: r.width())
+            return best if best.width() >= 80 else None
+
+        for fn in ((above, beside) if pr.width() >= pr.height() else (beside, above)):
+            r = fn()
+            if r is not None:
+                return r
+        return rect
 
     def _paint_seekbar(self, p: QPainter):
         g = self._seekbar_geometry()
@@ -1666,10 +2125,27 @@ class Viewer(QWidget):
     def zoom_by(self, factor):
         self._zoom_at(factor, QPointF(self.width() / 2, self.height() / 2))
 
+    # Plain wheel cycles items (scroll down = next, up = previous, like Right / Left);
+    # Ctrl + wheel zooms around the cursor. High-resolution wheels and touchpads send
+    # many small deltas, so they are accumulated and one item is stepped per 120 units.
     def wheelEvent(self, e):
         dy = e.angleDelta().y()
-        if dy:
+        if not dy:
+            return
+        if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._wheel_acc = 0.0
             self._zoom_at(1.15 ** (dy / 120.0), e.position())
+            return
+        if self._wheel_acc * dy < 0:            # direction reversed: start afresh
+            self._wheel_acc = 0.0
+        self._wheel_acc += dy
+        while self._wheel_acc <= -120:          # scroll down -> next
+            self._wheel_acc += 120
+            self.go(self.index + 1, immediate=False)
+        while self._wheel_acc >= 120:           # scroll up -> previous
+            self._wheel_acc -= 120
+            self.go(self.index - 1, immediate=False)
+        e.accept()
 
     # --------------------------------------------------------------- mouse --
     def mousePressEvent(self, e):
@@ -1750,7 +2226,8 @@ class Viewer(QWidget):
     # Stay visible while pinned or in use (re-checked every 30 s); otherwise hide the
     # panel, collapse the top bar and blank the cursor in fullscreen.
     def _hide_controls(self):
-        busy = self.panel.underMouse() or self.topbar._down or self._drag is not None
+        busy = (self.panel.underMouse() or self.panel.dragging or self.topbar._down
+                or self._drag is not None)
         if self._pinned or busy:
             self._hide_timer.start(30000)
             return
@@ -1766,9 +2243,10 @@ class Viewer(QWidget):
         self.topbar.set_state(self.index, n)
         if n:
             rel = os.path.relpath(self.items[self.index], self.root)
-            self.panel.set_info(f"{self.index + 1} / {n}   {rel}")
+            self.panel.set_info(f"{self.index + 1} / {n}", rel)
         else:
             self.panel.set_info("no media")
+        self._place_overlays()                  # the info text may wrap onto more lines
 
     # Sync button icons/checks with state; mute and volume appear only when a sound
     # device exists.
@@ -1925,6 +2403,8 @@ def parse_args(argv):
     ap.add_argument("--icon-padding", type=int, default=None, help="set icon button padding in pixels (0 and negative allowed; default: automatic, 1/5 of the icon size)")
     ap.add_argument("--controls", choices=["visible", "hidden"], default="visible", help="initial state of on-screen controls")
     ap.add_argument("--controls-opacity", type=float, default=0.0, help="controls background opacity from 0.0 to 1.0 (default: 0.0)")
+    ap.add_argument("--controls-dock", "--dock", dest="controls_dock", type=_dock_arg, default="bottom",
+                    metavar="DOCK", help="control panel position: bottom, top, left or right (default: bottom)")
 
     # Command-line flags for keys 1 through 0 (-a1 / --action-1 through -a0 / --action-10)
     ap.add_argument("-a1", "--action-1", default="", help="Command to run when pressing key 1")
