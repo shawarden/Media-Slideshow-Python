@@ -9,26 +9,30 @@ USAGE
     With no path a folder chooser opens. A file path opens that file's folder
     and starts on that file. Sub-folders are always read recursively.
 
-    -i, --interval SEC        seconds per image while the slideshow is playing (5)
-    --play                    start playing instead of paused
-    --shuffle                 force shuffle      (default: shuffle only if the folder
-    --no-shuffle              force natural sort  has media in sub-folders)
-    --no-rotate               start with rotate-to-fit off
-    --windowed                do not start fullscreen
-    --include-hidden          include dot-files and dot-folders
-    --icon-size SIZE          set toolbar icon button size in pixels (default: 64)
-    --icon-padding PAD        set icon button padding in pixels (0 and negative values
-                              are allowed; default: automatic, 1/5 of the icon size)
-    --controls [visible|hidden] initial state of on-screen controls (default: visible)
-    --controls-opacity OPACITY controls background opacity from 0.0 to 1.0 (default: 0.0)
-    --controls-dock DOCK      where the control panel sits: bottom, top, left or right
-                              (default: bottom; --dock is a short alias)
-    --controls-order ORDER    comma- or space-separated order of control items, supporting
-                              multiple instances (e.g. prev,next,folder,prev,next)
-    -a1, --action-1 CMD       Command for key 1 (supports {path}, which is shell-quoted
-                              automatically - do not add quotes around it)
-    ...
-    -a0, --action-10 CMD      Command for key 0 (supports {path}, as above)
+    Short  Long                      Description
+    -i     --interval SEC            seconds per image while the slideshow is playing (5)
+    -w     --windowed                do not start fullscreen
+    -s     --icon-size SIZE          toolbar icon button size in pixels (default: 64)
+    -p     --icon-padding PAD        icon button padding in pixels (0 and negative values
+                                     are allowed; default: automatic, 1/5 of the icon size)
+    -v     --controls STATE          initial state of on-screen controls: visible or
+                                     hidden (default: visible)
+    -t     --controls-opacity ALPHA  controls background opacity, 0.0 to 1.0 (default: 0.0)
+    -d     --controls-dock DOCK      where the control panel sits: bottom, top, left or
+                                     right (default: bottom; --dock is an alias)
+    -o     --controls-order ORDER    comma- or space-separated order of control items,
+                                     repeats allowed (e.g. prev,next,folder,prev,next);
+                                     names: prev next play shuffle rotate info pin
+                                     trash folder quit sep (--control-order is an alias)
+    -a1    --action-1 CMD            command for key 1 (supports {path}, which is
+                                     shell-quoted automatically - do not add quotes)
+    ...    ...
+    -a0    --action-10 CMD           command for key 0 (supports {path}, as above)
+           --play                    start playing instead of paused
+           --shuffle                 force shuffle      (default: shuffle only if the
+           --no-shuffle              force natural sort  folder has media in sub-folders)
+           --no-rotate               start with rotate-to-fit off
+           --include-hidden          include dot-files and dot-folders
 
 KEYS / MOUSE
     Space           Next
@@ -45,7 +49,8 @@ KEYS / MOUSE
     A               Auto-rotate to fit on/off
     1~0             Run custom shell commands (configured via CLI or COMMAND_MAPPINGS)
     Delete          Move current file to trash
-    O / Ctrl+O      Open folder
+    O / Ctrl+O      Open folder: new slideshow from a chosen folder (the dialog opens one
+                    level up, with the current picture's folder pre-selected)
     F / F11         Fullscreen
     Esc / Q         Quit
     H               Toggle keep controls visible (pin)
@@ -1763,16 +1768,24 @@ class Viewer(QWidget):
         argv.extend(getattr(a, "qt_args", []))
         return argv
 
-    # The dialog starts in the current file's folder. The new slideshow is a separate
-    # detached process; this one stays underneath, paused.
+    # The dialog opens in the PARENT of the current picture's folder with that folder
+    # pre-selected (selectFile), so one click on "Choose" re-opens the same folder, and
+    # its siblings are right there. Opening *inside* the current folder would show its
+    # pictures and hide the folder itself. If a platform's native dialog ignores
+    # pre-selection, you still land one level up and can see the current folder. The
+    # new slideshow is a separate detached process; this one stays underneath, paused.
     def open_folder(self):
-        start = os.path.dirname(self.items[self.index]) if self.items else self.root
+        cur = os.path.normpath(os.path.dirname(self.items[self.index])
+                               if self.items else self.root)
+        parent = os.path.dirname(cur) or cur    # "/" has no parent: stay there
         was_playing = self.playing
-        folder = QFileDialog.getExistingDirectory(
-            self, "Choose a folder for a new slideshow", start,
-            QFileDialog.Option.ShowDirsOnly)
-        if not folder:
+        dlg = QFileDialog(self, "Choose a folder for a new slideshow", parent)
+        dlg.setFileMode(QFileDialog.FileMode.Directory)
+        dlg.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        dlg.selectFile(cur)
+        if dlg.exec() != QFileDialog.DialogCode.Accepted or not dlg.selectedFiles():
             return
+        folder = dlg.selectedFiles()[0]
         QProcess.startDetached(sys.executable, self._child_argv(folder))
         if was_playing:                         # leave this one paused underneath
             self.set_playing(False)
