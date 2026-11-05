@@ -23,6 +23,8 @@ USAGE
     --controls-opacity OPACITY controls background opacity from 0.0 to 1.0 (default: 0.0)
     --controls-dock DOCK      where the control panel sits: bottom, top, left or right
                               (default: bottom; --dock is a short alias)
+    --controls-order ORDER    comma- or space-separated order of control items, supporting
+                              multiple instances (e.g. prev,next,folder,prev,next)
     -a1, --action-1 CMD       Command for key 1 (supports {path}, which is shell-quoted
                               automatically - do not add quotes around it)
     ...
@@ -194,6 +196,16 @@ def _dock_arg(value: str) -> str:
         raise argparse.ArgumentTypeError(
             f"invalid dock '{value}' (choose bottom, top, left or right)")
     return key
+
+
+def _control_order_arg(value: str) -> list[str]:
+    parts = [p.strip().lower() for p in re.split(r"[\s,]+", value) if p.strip()]
+    valid_names = {"prev", "next", "play", "shuffle", "rotate", "info", "pin", "trash", "folder", "quit", "sep"}
+    for p in parts:
+        if p not in valid_names:
+            raise argparse.ArgumentTypeError(
+                f"invalid control item '{p}' (choose from prev, next, play, shuffle, rotate, info, pin, trash, folder, quit, sep)")
+    return parts
 
 
 # -> 'image' | 'video' | None, decided purely by file extension.
@@ -583,6 +595,37 @@ def _sep(height: int = 26, parent=None):
 
 # Soft shadow keeps labels readable over bright images now that the panel background can
 # be fully transparent (default opacity 0).
+class MultiButtonProxy:
+    """Proxies state changes and signal connections to multiple button instances."""
+    def __init__(self, buttons):
+        self._buttons = buttons
+
+    def setChecked(self, checked):
+        for b in self._buttons:
+            b.setChecked(checked)
+
+    def set_icon(self, name):
+        for b in self._buttons:
+            b.set_icon(name)
+
+    def setDown(self, down):
+        for b in self._buttons:
+            b.setDown(down)
+
+    def isChecked(self):
+        return self._buttons[0].isChecked() if self._buttons else False
+
+    @property
+    def clicked(self):
+        class SignalProxy:
+            def __init__(self, buttons):
+                self.buttons = buttons
+            def connect(self, slot):
+                for b in self.buttons:
+                    b.clicked.connect(slot)
+        return SignalProxy(self._buttons)
+
+
 def _apply_drop_shadow(widget: QWidget, radius: float = 6.0, offset_y: float = 1.0):
     effect = QGraphicsDropShadowEffect(widget)
     effect.setBlurRadius(radius)
@@ -618,7 +661,7 @@ class Panel(QWidget):
     LONG_PRESS_SLOP = 10             # px of movement that turns the press into a normal click
     MAX_INFO_LINES = 4
 
-    def __init__(self, parent, icon_size: int = 40, icon_padding: int | None = None, opacity: float = 0.8):
+    def __init__(self, parent, icon_size: int = 40, icon_padding: int | None = None, opacity: float = 0.8, control_order=None):
         super().__init__(parent)
         self.setObjectName("panel")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -659,45 +702,39 @@ class Panel(QWidget):
         def btn(icon, tip, checkable=False):
             return IconButton(icon, tip, icon_size, icon_padding, self, checkable=checkable)
 
-        self.b_prev = btn("prev", "Previous  (Left)")
-        self.b_play = btn("play", "Play / pause slideshow  (Space)")
-        self.b_next = btn("next", "Next  (Right)")
-        self.b_shuffle = btn("shuffle", "Toggle shuffle / sorted mode  (S)", True)
-        self.b_rot = btn("rotate", "Rotate to best fit  (A)", True)
-        self.b_info = btn("info", "Toggle file info  (I)", True)
-        self.b_pin = btn("pin", "Keep controls visible / pin  (H)", True)
-        self.b_del = btn("trash", "Delete current file  (Delete)")
-        self.b_folder = btn("folder", "Open folder in a new slideshow  (O)")
-        self.b_quit = btn("quit", "Quit slideshow  (Q)")
-
-        # name -> widget lookup for CONTROL_ORDER. Widgets not listed there are created
-        # but never shown.
-        widgets_map = {
-            "prev": self.b_prev,
-            "play": self.b_play,
-            "next": self.b_next,
-            "shuffle": self.b_shuffle,
-            "rotate": self.b_rot,
-            "info": self.b_info,
-            "pin": self.b_pin,
-            "trash": self.b_del,
-            "folder": self.b_folder,
-            "quit": self.b_quit,
+        button_specs = {
+            "prev": ("prev", "Previous  (Left)", False, "b_prev"),
+            "play": ("play", "Play / pause slideshow  (Space)", False, "b_play"),
+            "next": ("next", "Next  (Right)", False, "b_next"),
+            "shuffle": ("shuffle", "Toggle shuffle / sorted mode  (S)", True, "b_shuffle"),
+            "rotate": ("rotate", "Rotate to best fit  (A)", True, "b_rot"),
+            "info": ("info", "Toggle file info  (I)", True, "b_info"),
+            "pin": ("pin", "Keep controls visible / pin  (H)", True, "b_pin"),
+            "trash": ("trash", "Delete current file  (Delete)", False, "b_del"),
+            "folder": ("folder", "Open folder in a new slideshow  (O)", False, "b_folder"),
+            "quit": ("quit", "Quit slideshow  (Q)", False, "b_quit"),
         }
 
-        # Every flowed widget in display order: (widget, kind, group). kind picks its size
-        # (btn / sep / time / volume); group says when it is shown: main = always,
-        # video = while a video is current, audio = video and a sound device exists.
+        self._button_instances = {name: [] for name in button_specs}
         self._items = []
-        for item in CONTROL_ORDER:
+        order = control_order if control_order is not None else CONTROL_ORDER
+        for item in order:
             if item == "sep":
                 self._items.append((_sep(self.sep_h, self), "sep", "main"))
-            elif item in widgets_map:
-                self._items.append((widgets_map[item], "btn", "main"))
-        used = {id(w) for w, _k, _g in self._items}
-        for w in widgets_map.values():
-            if id(w) not in used:
-                w.hide()
+            elif item in button_specs:
+                icon, tip, checkable, _attr = button_specs[item]
+                b = btn(icon, tip, checkable=checkable)
+                self._button_instances[item].append(b)
+                self._items.append((b, "btn", "main"))
+
+        for name, (icon, tip, checkable, attr_name) in button_specs.items():
+            btns = self._button_instances[name]
+            if not btns:
+                b = btn(icon, tip, checkable=checkable)
+                b.hide()
+                btns.append(b)
+            proxy = MultiButtonProxy(btns) if len(btns) > 1 else btns[0]
+            setattr(self, attr_name, proxy)
 
         # Video-only controls (play/pause, time, mute, volume).
         self._vsep = _sep(self.sep_h, self)
@@ -1115,7 +1152,7 @@ class Viewer(QWidget):
         self.setStyleSheet("Viewer { background: black; }")
 
         self.topbar = TopBar(self)
-        self.panel = Panel(self, icon_size=args.icon_size, icon_padding=args.icon_padding, opacity=args.controls_opacity)
+        self.panel = Panel(self, icon_size=args.icon_size, icon_padding=args.icon_padding, opacity=args.controls_opacity, control_order=args.controls_order)
         self.panel.b_rot.setChecked(self.auto_rotate)
         self.panel.b_info.setChecked(self.show_file_info)
         self.panel.b_pin.setChecked(self._pinned)
@@ -1717,6 +1754,8 @@ class Viewer(QWidget):
         argv.append(f"--controls={a.controls}")
         argv.append(f"--controls-dock={self._dock}")
         argv.append(f"--controls-opacity={a.controls_opacity}")
+        if a.controls_order:
+            argv.append(f"--controls-order={','.join(a.controls_order)}")
         for n in range(1, 11):                  # -a1 .. -a0 command-line actions
             cmd = getattr(a, f"action_{n}", "")
             if cmd:
@@ -2386,25 +2425,23 @@ def _checker() -> QPixmap:
 
 # --------------------------------------------------------------------------- #
 def parse_args(argv):
-    ap = argparse.ArgumentParser(
-        description="Image + video slideshow (Wayland / X11). Run with no path to pick a folder.")
+    ap = argparse.ArgumentParser(description="Image + video slideshow (Wayland / X11). Run with no path to pick a folder.")
     ap.add_argument("path", nargs="?", help="folder (or a file inside the folder to start on)")
-    ap.add_argument("-i", "--interval", type=float, default=5.0, help="seconds per image (5)")
     ap.add_argument("--play", action="store_true", help="start playing instead of paused")
+    ap.add_argument("--no-rotate", action="store_true", help="start with rotate-to-fit off")
+    ap.add_argument("--include-hidden", action="store_true")
+    ap.add_argument("-i", "--interval", type=float, default=5.0, help="seconds per image (5)")
+    ap.add_argument("-w", "--windowed", action="store_true", help="do not start fullscreen")
+    ap.add_argument("-s", "--icon-size", type=int, default=64, help="set toolbar icon button size in pixels (64)")
+    ap.add_argument("-p", "--icon-padding", type=int, default=None, help="set icon button padding in pixels (0 and negative allowed; default: automatic, 1/5 of the icon size)")
+    ap.add_argument("-v", "--controls", choices=["visible", "hidden"], default="visible", help="initial state of on-screen controls")
+    ap.add_argument("-t", "--controls-opacity", type=float, default=0.0, help="controls background opacity from 0.0 to 1.0 (default: 0.0)")
+    ap.add_argument("-d", "--controls-dock", "--dock", dest="controls_dock", type=_dock_arg, default="bottom",metavar="DOCK", help="control panel position: bottom, top, left or right (default: bottom)")
+    ap.add_argument("-o", "--controls-order", "--control-order", dest="controls_order", type=_control_order_arg, default=None,metavar="ORDER", help="comma- or space-separated order of control panel items, supporting duplicates (prev, next, play, shuffle, rotate, info, pin, trash, folder, quit, sep)")
+
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--shuffle", dest="shuffle", action="store_true", default=None)
     g.add_argument("--no-shuffle", dest="shuffle", action="store_false")
-    ap.add_argument("--no-rotate", action="store_true", help="start with rotate-to-fit off")
-    ap.add_argument("--windowed", action="store_true", help="do not start fullscreen")
-    ap.add_argument("--include-hidden", action="store_true")
-    ap.add_argument("--icon-size", type=int, default=64, help="set toolbar icon button size in pixels (64)")
-    # Padding: unset (None) = automatic, 20% of the icon size; any int, including 0 and
-    # negative values, is used as given.
-    ap.add_argument("--icon-padding", type=int, default=None, help="set icon button padding in pixels (0 and negative allowed; default: automatic, 1/5 of the icon size)")
-    ap.add_argument("--controls", choices=["visible", "hidden"], default="visible", help="initial state of on-screen controls")
-    ap.add_argument("--controls-opacity", type=float, default=0.0, help="controls background opacity from 0.0 to 1.0 (default: 0.0)")
-    ap.add_argument("--controls-dock", "--dock", dest="controls_dock", type=_dock_arg, default="bottom",
-                    metavar="DOCK", help="control panel position: bottom, top, left or right (default: bottom)")
 
     # Command-line flags for keys 1 through 0 (-a1 / --action-1 through -a0 / --action-10)
     ap.add_argument("-a1", "--action-1", default="", help="Command to run when pressing key 1")
