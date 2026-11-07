@@ -12,6 +12,7 @@ USAGE
     Short  Long                      Description
     -i     --interval SEC            seconds per image while the slideshow is playing (5)
     -w     --windowed                do not start fullscreen
+    -x     --maximized               start maximized without a title bar, leaving system taskbars visible
     -s     --icon-size SIZE          toolbar icon button size in pixels (default: 64)
     -p     --icon-padding PAD        icon button padding in pixels (0 and negative values
                                      are allowed; default: automatic, 1/5 of the icon size)
@@ -33,6 +34,10 @@ USAGE
            --no-shuffle              force natural sort  folder has media in sub-folders)
            --no-rotate               start with rotate-to-fit off
            --include-hidden          include dot-files and dot-folders
+    (--play, --shuffle, --no-shuffle, --no-rotate and --include-hidden have no short form.)
+    A short option can take its value as "-i 3", "-i3" or "-i=3"; long ones as
+    "--interval 3" or "--interval=3". Use "=" for values starting with "-"
+    (e.g. -p=-4 or --icon-padding=-4).
 
 KEYS / MOUSE
     Space           Next
@@ -67,6 +72,11 @@ DEPENDENCIES
     HEIC / AVIF / JPEG XL when Qt has no plugin for them.
     Arch:   pacman -S pyside6 qt6-multimedia-ffmpeg qt6-wayland qt6-svg \
                        qt6-imageformats python-pillow
+
+STARTUP MESSAGES
+    Harmless Qt / KDE / FFmpeg / Mesa warnings are silenced by environment settings at
+    the top of this file (search for "Quiet harmless"). Your own QT_LOGGING_RULES,
+    QT_FFMPEG_DECODING_HW_DEVICE_TYPES and MESA_VK_IGNORE_CONFORMANCE_WARNING override them.
 """
 from __future__ import annotations
 
@@ -80,6 +90,29 @@ import subprocess
 import sys
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+
+# --- Quiet harmless startup messages ---------------------------------------------------
+# Must run BEFORE Qt is imported; child processes (audio probe, folder button) inherit it.
+# Anything you set yourself wins: your own QT_LOGGING_RULES are appended after ours (the
+# last matching rule wins), and the other two use setdefault. Examples:
+#   QT_LOGGING_RULES="kf.iconthemes.warning=true" slideshow.py ...   (show one again)
+#   QT_FFMPEG_DECODING_HW_DEVICE_TYPES="vaapi,cuda" slideshow.py ... (NVIDIA decoding)
+_QUIET_RULES = ";".join((
+    "kf.iconthemes.warning=false",       # KDE theme: 'Icon theme "gnome" not found'
+    "qt.qpa.services.warning=false",     # 'Failed to register with host portal' (the app
+                                         #  has no installed .desktop file; harmless)
+    "qt.multimedia.ffmpeg.info=false",   # 'Using Qt multimedia with FFmpeg version ...'
+))
+os.environ["QT_LOGGING_RULES"] = ";".join(
+    filter(None, (_QUIET_RULES, os.environ.get("QT_LOGGING_RULES"))))
+# Qt's FFmpeg backend tries every hardware decoder on its priority list, and libvdpau /
+# the Vulkan driver print to stderr when one is missing ('Failed to open VDPAU backend
+# libvdpau_nvidia.so', 'radv is not a conformant Vulkan implementation'). Limiting the
+# list to VAAPI (AMD / Intel) avoids probing them; videos fall back to software decoding
+# if VAAPI isn't usable. Set the variable to "," to disable hardware decoding entirely.
+os.environ.setdefault("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", "vaapi")
+# Mesa's banner for GPUs it doesn't certify as conformant; harmless for a viewer.
+os.environ.setdefault("MESA_VK_IGNORE_CONFORMANCE_WARNING", "true")
 
 from PySide6.QtCore import (QEvent, QFile, QPoint, QPointF, QProcess, QRect, QRectF,
                             QSize, Qt, QTimer, QUrl, Signal)
@@ -1094,7 +1127,8 @@ class Viewer(QWidget):
         self.auto_rotate = not args.no_rotate
         self.muted = True                       # always muted at the start of a session
         self.audio_ok, self.audio_out = False, None
-        self.windowed_start = args.windowed
+        self.windowed_start = getattr(args, "windowed", False)
+        self.maximized_start = getattr(args, "maximized", False)
         self.show_file_info = False
 
         # media / view state
@@ -1749,6 +1783,8 @@ class Viewer(QWidget):
             argv.append("--shuffle")
         if self.windowed_start:
             argv.append("--windowed")
+        if getattr(a, "maximized", False):
+            argv.append("--maximized")
         if not self.auto_rotate:
             argv.append("--no-rotate")
         if a.include_hidden:
@@ -2445,6 +2481,7 @@ def parse_args(argv):
     ap.add_argument("--include-hidden", action="store_true")
     ap.add_argument("-i", "--interval", type=float, default=5.0, help="seconds per image (5)")
     ap.add_argument("-w", "--windowed", action="store_true", help="do not start fullscreen")
+    ap.add_argument("-x", "--maximized", action="store_true", help="start maximized without a title bar, leaving system taskbars visible")
     ap.add_argument("-s", "--icon-size", type=int, default=64, help="set toolbar icon button size in pixels (64)")
     ap.add_argument("-p", "--icon-padding", type=int, default=None, help="set icon button padding in pixels (0 and negative allowed; default: automatic, 1/5 of the icon size)")
     ap.add_argument("-v", "--controls", choices=["visible", "hidden"], default="visible", help="initial state of on-screen controls")
@@ -2534,7 +2571,10 @@ def main(argv=None):
     shuffled = args.shuffle if args.shuffle is not None else has_sub_media
 
     view = Viewer(root, files, args, shuffled, start_file, has_sub_media)
-    if args.windowed:
+    if getattr(args, "maximized", False):
+        view.setWindowFlags(view.windowFlags() | Qt.WindowType.FramelessWindowHint)
+        view.showMaximized()
+    elif getattr(args, "windowed", False):
         view.resize(1280, 800)
         view.show()
     else:
